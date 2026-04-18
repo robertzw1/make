@@ -8,17 +8,36 @@ treated as deforestation after 2020.
 ## Quick start
 
 ```bash
-# 1) install into .venv
-make install
+# 1) install everything and symlink the challenge dataset
+make setup
 
-# 2) generate a synthetic tile so the pipeline can run without the S3 download
-make mock
-
-# 3) produce a zero-training consensus submission
+# 2) produce a zero-training consensus submission on the real data
 make baseline
 
-# 4) local metrics against the training labels (pseudo-GT = training consensus)
+# 3) local metrics against the training labels (pseudo-GT = training consensus)
 make evaluate
+```
+
+`make setup` is idempotent and does three things:
+
+1. Builds `.venv/` (falls back to `pip.pyz` when `python3-venv` is missing,
+   so it works on minimal Docker images).
+2. `pip install -r requirements.txt && pip install -e .`
+3. Symlinks `data/makeathon-challenge → ../makeathon26/data/makeathon-challenge`
+   so the configured `data.root` resolves inside the workspace.
+
+If the dataset lives elsewhere, override the source path:
+
+```bash
+make link-data MAKEATHON_DATA=/path/to/makeathon-challenge
+```
+
+If the dataset isn't available at all, generate a tiny synthetic tile
+instead and run the pipeline on it:
+
+```bash
+make mock        # writes data/makeathon-challenge/{sentinel-1,2,...}/MOCK_0_0_*
+make baseline    # uses the mock tile via configs/default.yaml
 ```
 
 The output is written to `submissions/baseline.geojson` — upload this to the

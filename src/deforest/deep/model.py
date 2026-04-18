@@ -107,10 +107,15 @@ class _Down(nn.Module):
 
 
 class _Up(nn.Module):
-    def __init__(self, ci: int, co: int, dropout: float):
+    def __init__(self, ci: int, co: int, dropout: float, *, skip_channels: int | None = None):
         super().__init__()
+        # Decoder input is reduced to `co` channels then concatenated with the
+        # encoder skip — whose width is generally NOT equal to `co` in this
+        # network (e.g. s3 is c*8 while the matching decoder output is c*4).
+        # `skip_channels` defaults to `co` to preserve the symmetric-U-Net case.
+        sk = co if skip_channels is None else skip_channels
         self.reduce = nn.Conv2d(ci, co, 1)
-        self.block = _double_conv(co * 2, co, dropout)
+        self.block = _double_conv(co + sk, co, dropout)
 
     def forward(self, x, skip):
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
@@ -168,10 +173,12 @@ class ChangeUNet(nn.Module):  # type: ignore[misc]
             dropout=cfg.dropout,
         )
 
-        self.up4 = _Up(c * 8, c * 8, cfg.dropout)
-        self.up3 = _Up(c * 8, c * 4, cfg.dropout)
-        self.up2 = _Up(c * 4, c * 2, cfg.dropout)
-        self.up1 = _Up(c * 2, c, cfg.dropout)
+        # Skip widths come from the encoder's `_Down.block` output channels:
+        #   s4 = c*8, s3 = c*8, s2 = c*4, s0 = c   (s1 is intentionally unused)
+        self.up4 = _Up(c * 8, c * 8, cfg.dropout, skip_channels=c * 8)
+        self.up3 = _Up(c * 8, c * 4, cfg.dropout, skip_channels=c * 8)
+        self.up2 = _Up(c * 4, c * 2, cfg.dropout, skip_channels=c * 4)
+        self.up1 = _Up(c * 2, c, cfg.dropout, skip_channels=c)
 
         self.change_head = nn.Conv2d(c, 1, kernel_size=1)
         self.month_head = nn.Conv2d(c, cfg.months, kernel_size=1)

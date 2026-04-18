@@ -12,7 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import rasterio
+from rasterio.warp import Resampling
 
+from ..data.align import reproject_multiband_to_grid, reproject_to_grid
 from ..data.readers import read_s1, read_s2, list_s1_months, list_s2_months
 
 
@@ -40,20 +43,44 @@ def ndmi_from_s2(bands: np.ndarray) -> np.ndarray:
 # --- Annual statistics -----------------------------------------------------
 
 
-def s2_annual_stats(s2_dir: str | Path, year: int) -> dict[str, np.ndarray] | None:
-    """Compute median NDVI/NDMI and NDVI slope for the given year."""
+def s2_annual_stats(
+    s2_dir: str | Path,
+    year: int,
+    *,
+    ref_transform=None,
+    ref_crs=None,
+    ref_shape: tuple[int, int] | None = None,
+) -> dict[str, np.ndarray] | None:
+    """Compute median NDVI/NDMI and NDVI slope for the given year.
+
+    Real-world tiles often have monthly composites with slightly different
+    extents/transforms. If ``ref_*`` are provided each monthly composite is
+    resampled onto that grid before stacking; otherwise the first composite
+    we successfully read defines the reference (and later mismatched
+    composites get reprojected onto it).
+    """
     months = [m for (y, m) in list_s2_months(s2_dir) if y == year]
     if not months:
         return None
 
     ndvi_stack, ndmi_stack = [], []
-    shape: tuple[int, int] | None = None
     for m in months:
         tif = Path(s2_dir) / f"{Path(s2_dir).name}_{year}_{m}.tif"
         if not tif.exists():
             continue
-        bands, _ = read_s2(tif)
-        shape = shape or bands.shape[1:]
+        bands, prof = read_s2(tif)
+        if ref_transform is None or ref_crs is None or ref_shape is None:
+            # Use this composite as the implicit reference for the rest.
+            ref_transform = prof["transform"]
+            ref_crs = prof["crs"]
+            ref_shape = prof["shape"]
+        elif bands.shape[1:] != ref_shape or prof["transform"] != ref_transform:
+            bands = reproject_multiband_to_grid(
+                bands,
+                src_transform=prof["transform"], src_crs=prof["crs"],
+                dst_transform=ref_transform, dst_crs=ref_crs,
+                dst_shape=ref_shape, resampling=Resampling.bilinear,
+            )
         ndvi_stack.append(ndvi_from_s2(bands))
         ndmi_stack.append(ndmi_from_s2(bands))
 
@@ -85,8 +112,20 @@ def s2_annual_stats(s2_dir: str | Path, year: int) -> dict[str, np.ndarray] | No
     }
 
 
-def s1_annual_stats(s1_dir: str | Path, year: int) -> dict[str, np.ndarray] | None:
-    """Mean / std / min of VV in dB for the given year (any orbit)."""
+def s1_annual_stats(
+    s1_dir: str | Path,
+    year: int,
+    *,
+    ref_transform=None,
+    ref_crs=None,
+    ref_shape: tuple[int, int] | None = None,
+) -> dict[str, np.ndarray] | None:
+    """Mean / std / min of VV in dB for the given year (any orbit).
+
+    When a reference grid is supplied each monthly Sentinel-1 raster is
+    resampled onto it (S1 ships at 30 m, S2 at 10 m, so callers will
+    typically pass the S2 grid as the reference).
+    """
     entries = [(y, m, o) for (y, m, o) in list_s1_months(s1_dir) if y == year]
     if not entries:
         return None
@@ -96,16 +135,44 @@ def s1_annual_stats(s1_dir: str | Path, year: int) -> dict[str, np.ndarray] | No
         tif = Path(s1_dir) / f"{Path(s1_dir).name}_{y}_{m}_{o}.tif"
         if not tif.exists():
             continue
-        vv, _ = read_s1(tif)
+        vv, prof = read_s1(tif)
+        if ref_transform is not None and ref_crs is not None and ref_shape is not None:
+            if vv.shape != ref_shape or prof["transform"] != ref_transform:
+                vv = reproject_to_grid(
+                    vv,
+                    src_transform=prof["transform"], src_crs=prof["crs"],
+                    dst_transform=ref_transform, dst_crs=ref_crs,
+                    dst_shape=ref_shape, resampling=Resampling.bilinear,
+                    src_nodata=np.nan, dst_nodata=np.nan, dtype=np.float32,
+                )
         stack.append(vv)
     if not stack:
         return None
+    # Allow any single-month-only mismatch by aligning all S1 frames to the
+    # first one we read when no explicit reference grid is given.
+    if not all(a.shape == stack[0].shape for a in stack):
+        target = stack[0].shape
+        stack = [a if a.shape == target else _crop_or_pad(a, target) for a in stack]
     arr = np.stack(stack, axis=0)
-    return {
-        "mean_vv": np.nanmean(arr, axis=0).astype(np.float32),
-        "std_vv": np.nanstd(arr, axis=0).astype(np.float32),
-        "min_vv": np.nanmin(arr, axis=0).astype(np.float32),
-    }
+    with np.errstate(all="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            return {
+                "mean_vv": np.nanmean(arr, axis=0).astype(np.float32),
+                "std_vv": np.nanstd(arr, axis=0).astype(np.float32),
+                "min_vv": np.nanmin(arr, axis=0).astype(np.float32),
+            }
+
+
+def _crop_or_pad(arr: np.ndarray, target: tuple[int, int]) -> np.ndarray:
+    """Centre-crop or zero-pad a 2-D array to ``target`` shape (rare fallback)."""
+    h, w = arr.shape
+    th, tw = target
+    out = np.full(target, np.nan if np.issubdtype(arr.dtype, np.floating) else 0, dtype=arr.dtype)
+    sh = min(h, th); sw = min(w, tw)
+    out[:sh, :sw] = arr[:sh, :sw]
+    return out
 
 
 def pack_features(

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -38,7 +39,7 @@ except ImportError:  # pragma: no cover - torch optional
     torch = None  # type: ignore
 
 from ..runtime import Hardware, Scales, autoscale_defaults, detect_hardware
-from .dataset import PatchDataset, PatchRef, load_patch_index
+from .dataset import PatchDataset, PatchRef, load_patch_index, patch_collate
 from .losses import LossWeights, total_loss
 from .model import ChangeUNet, ChangeUNetConfig, build_model
 
@@ -70,11 +71,25 @@ def train(
     _log(f"[deep.train] scales={scales}")
 
     # --- data --------------------------------------------------------------
-    all_refs = load_patch_index(cache_dir)
+    # Read the train-split index when it exists; otherwise fall back to the
+    # combined ``patch_index.jsonl`` (kept for backward compatibility with
+    # caches built before the per-split layout existed).
+    all_refs = load_patch_index(cache_dir, split="train")
     if not all_refs:
-        raise FileNotFoundError(f"Empty patch cache at {cache_dir}")
+        all_refs = load_patch_index(cache_dir)
+    if not all_refs:
+        raise FileNotFoundError(
+            f"Empty patch cache at {cache_dir}. "
+            "Did you run `make preprocess SERVER_CFG=configs/server.yaml`?"
+        )
     train_refs, val_refs = _split_refs(all_refs, val_tiles, val_fraction=cfg.get("val_fraction", 0.15))
     _log(f"[deep.train] train={len(train_refs)} patches, val={len(val_refs)} patches")
+    if not train_refs:
+        raise RuntimeError(
+            "Train split is empty after holding out the validation group. "
+            "Either run preprocess on more tiles or pass --val-tiles to pin "
+            "the held-out set explicitly."
+        )
 
     train_ds = PatchDataset(
         cache_dir,
@@ -93,22 +108,36 @@ def train(
         rng_seed=0,
     )
 
+    # Don't ask DataLoader for a batch larger than the dataset (otherwise
+    # ``drop_last=True`` yields zero batches and the loop dies with
+    # ``StopIteration``). Clamp once and reflect it back into ``scales`` so
+    # later log lines stay honest.
+    effective_batch = min(scales.batch_size, max(1, len(train_ds)))
+    if effective_batch != scales.batch_size:
+        _log(
+            f"[deep.train] dataset has only {len(train_ds)} train patches; "
+            f"clamping batch_size {scales.batch_size} -> {effective_batch}"
+        )
+    drop_last = len(train_ds) >= scales.batch_size
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=scales.batch_size,
+        batch_size=effective_batch,
         shuffle=True,
         num_workers=scales.num_workers,
         pin_memory=scales.pin_memory,
         persistent_workers=scales.persistent_workers and scales.num_workers > 0,
         prefetch_factor=scales.prefetch_factor if scales.num_workers > 0 else None,
-        drop_last=True,
+        drop_last=drop_last,
+        collate_fn=patch_collate,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=scales.batch_size,
+        batch_size=max(1, min(effective_batch, len(val_ds) or 1)),
         shuffle=False,
         num_workers=min(scales.num_workers, 4),
         pin_memory=scales.pin_memory,
+        collate_fn=patch_collate,
     )
 
     # --- model / optim ----------------------------------------------------
@@ -126,7 +155,35 @@ def train(
     _log(f"[deep.train] model: in_channels={in_channels} params={_count_params(model)/1e6:.2f}M")
 
     device = torch.device(scales.torch_device)
+
+    # Tier-2 (deep) training MUST run on the GPU on the MI300X droplet —
+    # silently falling back to CPU would burn hours and produce nothing
+    # useful. Refuse to start unless either a GPU was detected or the user
+    # explicitly opted into CPU training via DEFOREST_DEVICE=cpu.
+    require_gpu = os.environ.get("DEFOREST_REQUIRE_GPU", "1").strip() not in {"0", "false", "no"}
+    explicit_cpu = os.environ.get("DEFOREST_DEVICE", "").strip().lower() == "cpu"
+    if device.type == "cpu" and require_gpu and not explicit_cpu:
+        raise RuntimeError(
+            "Deep model would train on CPU (device=cpu). The Tier-2 deep "
+            "model is GPU-only on this project. Install ROCm/CUDA PyTorch "
+            "(`make install-gpu`) or explicitly opt in with "
+            "`DEFOREST_DEVICE=cpu DEFOREST_REQUIRE_GPU=0`."
+        )
+
     model = model.to(device)
+    # Confirm the placement actually took effect (catches subtle ROCm misconfig
+    # where torch.cuda.is_available() is True but moving fails silently).
+    p_device = next(model.parameters()).device
+    if require_gpu and not explicit_cpu and p_device.type == "cpu":
+        raise RuntimeError(
+            f"model.to({device}) did not move parameters off CPU "
+            f"(saw {p_device}). Refusing to train on CPU."
+        )
+    _log(
+        f"[deep.train] model on device={p_device} "
+        f"(torch.cuda.is_available={torch.cuda.is_available()}, "
+        f"hip={getattr(torch.version, 'hip', None)})"
+    )
 
     if resume is not None and Path(resume).exists():
         state = torch.load(resume, map_location="cpu")
@@ -161,6 +218,7 @@ def train(
     best_iou = -1.0
     global_step = 0
     t0 = time.time()
+    log_every = max(1, int(cfg.get("log_every_steps", 10)))
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
@@ -196,6 +254,13 @@ def train(
             for k, v in logs.items():
                 ep_logs[k] += v
             ep_logs["n"] += 1
+            if global_step % log_every == 0 or global_step == 1:
+                _log(
+                    f"[deep.train] step {global_step:>6d} epoch {epoch:02d} "
+                    f"loss={logs['loss']:.4f} focal={logs['focal']:.4f} "
+                    f"dice={logs['dice']:.4f} ce={logs['month_ce']:.4f} "
+                    f"({time.time() - t0:.0f}s)"
+                )
 
         for k in ["loss", "focal", "dice", "month_ce"]:
             ep_logs[k] /= max(1, ep_logs["n"])

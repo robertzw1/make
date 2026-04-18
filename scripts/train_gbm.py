@@ -73,10 +73,11 @@ def main() -> None:
             continue
         aef_feats = aef_features(aef_by_year)
 
-        s1_base = s1_annual_stats(paths.s1_dir(tid, split="train"), year_base)
-        s1_last = s1_annual_stats(paths.s1_dir(tid, split="train"), year_last)
-        s2_base = s2_annual_stats(s2_dir, year_base)
-        s2_last = s2_annual_stats(s2_dir, year_last)
+        grid = dict(ref_transform=ref_transform, ref_crs=ref_crs, ref_shape=ref_shape)
+        s1_base = s1_annual_stats(paths.s1_dir(tid, split="train"), year_base, **grid)
+        s1_last = s1_annual_stats(paths.s1_dir(tid, split="train"), year_last, **grid)
+        s2_base = s2_annual_stats(s2_dir, year_base, **grid)
+        s2_last = s2_annual_stats(s2_dir, year_last, **grid)
 
         X, names = pack_features(aef_feats, s2_base, s2_last, s1_base, s1_last)
         feature_names = names

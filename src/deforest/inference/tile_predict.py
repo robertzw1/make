@@ -104,10 +104,11 @@ def predict_tile(
 
     # ---- 3. S1/S2 annual statistics --------------------------------------
     s1_dir = paths.s1_dir(tile_id, split=split)
-    s1_base = s1_annual_stats(s1_dir, year_base)
-    s1_last = s1_annual_stats(s1_dir, year_last)
-    s2_base = s2_annual_stats(s2_dir, year_base)
-    s2_last = s2_annual_stats(s2_dir, year_last)
+    grid = dict(ref_transform=ref_transform, ref_crs=ref_crs, ref_shape=ref_shape)
+    s1_base = s1_annual_stats(s1_dir, year_base, **grid)
+    s1_last = s1_annual_stats(s1_dir, year_last, **grid)
+    s2_base = s2_annual_stats(s2_dir, year_base, **grid)
+    s2_last = s2_annual_stats(s2_dir, year_last, **grid)
 
     # ---- 4. Weak labels (train split only) -------------------------------
     fused: FusedLabels | None = None

@@ -44,7 +44,7 @@ from .data.readers import list_s2_months, read_aef
 from .features.aef import aef_features
 from .features.satellite import pack_features, s1_annual_stats, s2_annual_stats
 from .inference.tile_predict import _build_forest_mask_2020, _load_and_fuse_labels
-from .deep.dataset import PatchRef, write_patch_index
+from .deep.dataset import PatchRef, load_patch_index, write_patch_index
 from .labels.parsers import _UNIX_EPOCH  # reuse the UNIX epoch for month calc
 
 
@@ -101,10 +101,11 @@ def preprocess_tile(
         return tile_id, 0
 
     aef_feats = aef_features(aef_by_year)
-    s1_base = s1_annual_stats(data_paths.s1_dir(tile_id, split=split), year_base)
-    s1_last = s1_annual_stats(data_paths.s1_dir(tile_id, split=split), year_last)
-    s2_base = s2_annual_stats(s2_dir, year_base)
-    s2_last = s2_annual_stats(s2_dir, year_last)
+    grid = dict(ref_transform=ref_transform, ref_crs=ref_crs, ref_shape=ref_shape)
+    s1_base = s1_annual_stats(data_paths.s1_dir(tile_id, split=split), year_base, **grid)
+    s1_last = s1_annual_stats(data_paths.s1_dir(tile_id, split=split), year_last, **grid)
+    s2_base = s2_annual_stats(s2_dir, year_base, **grid)
+    s2_last = s2_annual_stats(s2_dir, year_last, **grid)
 
     X, feature_names = pack_features(aef_feats, s2_base, s2_last, s1_base, s1_last)
     F = X.shape[1]
@@ -193,7 +194,20 @@ def preprocess_all(
                 if on_progress is not None:
                     on_progress(tid, n)
 
-    write_patch_index(cfg.cache_dir, all_refs)
+    # Persist a per-split index AND a combined one. Running ``preprocess
+    # --split test`` after ``--split train`` (and vice versa) must not wipe
+    # the other split's patches from the combined ``patch_index.jsonl`` —
+    # the deep training loop reads only its split, but legacy callers and
+    # ``predict_ensemble`` still rely on the combined file existing.
+    write_patch_index(cfg.cache_dir, all_refs, split=split)
+    other_splits = [
+        s for s in ("train", "test", "val")
+        if s != split and (cfg.cache_dir / f"patch_index.{s}.jsonl").exists()
+    ]
+    combined: list[PatchRef] = list(all_refs)
+    for s in other_splits:
+        combined.extend(load_patch_index(cfg.cache_dir, split=s))
+    write_patch_index(cfg.cache_dir, combined, split=None)
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +228,12 @@ def _patch_refs_for_tile(
 ) -> list[PatchRef]:
     h, w = labels.shape
     refs: list[PatchRef] = []
+    # Skip tiles smaller than a single training patch. The dataset assumes
+    # every ref expands to ``(patch_size, patch_size)``; if the tile is
+    # smaller, slicing silently truncates and the collate step blows up
+    # with ``stack expects each tensor to be equal size``.
+    if h < patch_size or w < patch_size:
+        return refs
     ys = _axis(h, patch_size, stride)
     xs = _axis(w, patch_size, stride)
     for y in ys:

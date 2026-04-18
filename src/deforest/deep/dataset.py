@@ -76,8 +76,26 @@ class PatchRef:
     positive_fraction: float = 0.0
 
 
-def load_patch_index(cache_dir: Path) -> list[PatchRef]:
-    path = cache_dir / "patch_index.jsonl"
+def _index_path(cache_dir: Path, split: str | None) -> Path:
+    """Return the path to the patch index for ``split`` (or the combined one)."""
+    if split is None:
+        return cache_dir / "patch_index.jsonl"
+    return cache_dir / f"patch_index.{split}.jsonl"
+
+
+def load_patch_index(
+    cache_dir: Path, split: str | None = None
+) -> list[PatchRef]:
+    """Load a patch index.
+
+    ``split=None`` returns the combined index (legacy ``patch_index.jsonl``);
+    ``split="train"`` / ``"test"`` returns the per-split file written by
+    :func:`write_patch_index`. If the requested per-split file is missing
+    we fall back to the combined index so old caches keep working.
+    """
+    path = _index_path(cache_dir, split)
+    if not path.exists() and split is not None:
+        path = _index_path(cache_dir, None)
     if not path.exists():
         return []
     out: list[PatchRef] = []
@@ -95,8 +113,11 @@ def load_patch_index(cache_dir: Path) -> list[PatchRef]:
     return out
 
 
-def write_patch_index(cache_dir: Path, refs: Iterable[PatchRef]) -> Path:
-    path = cache_dir / "patch_index.jsonl"
+def write_patch_index(
+    cache_dir: Path, refs: Iterable[PatchRef], *, split: str | None = None
+) -> Path:
+    """Write a patch index file (combined or per-split)."""
+    path = _index_path(cache_dir, split)
     with path.open("w") as f:
         for r in refs:
             f.write(
@@ -170,13 +191,28 @@ class PatchDataset(Dataset):  # type: ignore[misc]
         ref = self.refs[idx]
         tile = self._tile(ref.tile_id)
         p = self.patch_size
-        y, x = ref.y, ref.x
+        _, h, w = tile.features.shape
+        # Clamp the patch origin so we never slice past the tile edge — the
+        # collate path requires every sample to be exactly (p, p). Some
+        # historical caches contain refs from tiny tiles where ``y + p > h``;
+        # without clamping numpy silently truncates and ``torch.stack`` later
+        # raises ``stack expects each tensor to be equal size``.
+        y = max(0, min(int(ref.y), max(0, h - p)))
+        x = max(0, min(int(ref.x), max(0, w - p)))
 
-        feats = np.asarray(tile.features[:, y : y + p, x : x + p], dtype=np.float32)
-        labels = np.asarray(tile.labels[y : y + p, x : x + p], dtype=np.float32)
-        month = np.asarray(tile.month[y : y + p, x : x + p], dtype=np.int64)
-        weight = np.asarray(tile.weight[y : y + p, x : x + p], dtype=np.float32)
-        forest = np.asarray(tile.forest[y : y + p, x : x + p], dtype=np.float32)
+        feats = np.array(tile.features[:, y : y + p, x : x + p], dtype=np.float32)
+        labels = np.array(tile.labels[y : y + p, x : x + p], dtype=np.float32)
+        month = np.array(tile.month[y : y + p, x : x + p], dtype=np.int64)
+        weight = np.array(tile.weight[y : y + p, x : x + p], dtype=np.float32)
+        forest = np.array(tile.forest[y : y + p, x : x + p], dtype=np.float32)
+
+        # Pad if the tile itself is smaller than a patch (degenerate tile).
+        if feats.shape[-2:] != (p, p):
+            feats = _pad_to(feats, (feats.shape[0], p, p))
+            labels = _pad_to(labels, (p, p))
+            month = _pad_to(month, (p, p))
+            weight = _pad_to(weight, (p, p))
+            forest = _pad_to(forest, (p, p))
 
         # Month head is undefined on no-event pixels — mark as ignore.
         y_month = np.where(labels > 0, month - 1, -100).astype(np.int64)
@@ -191,13 +227,43 @@ class PatchDataset(Dataset):  # type: ignore[misc]
                 feats, labels, y_month, weight, forest, self._rng
             )
 
+        # ``torch.from_numpy`` keeps numpy-owned storage which is NOT resizable;
+        # the multi-worker DataLoader with ``pin_memory=True`` then crashes in
+        # ``default_collate`` (``Trying to resize storage that is not resizable``).
+        # Allocating fresh torch tensors (via ``torch.tensor`` / ``.clone()``)
+        # gives torch-owned, resizable storage and fixes the collate path.
         return {
-            "x": torch.from_numpy(feats),
-            "y_change": torch.from_numpy(labels),
-            "y_month": torch.from_numpy(y_month),
-            "weight": torch.from_numpy(weight),
-            "forest": torch.from_numpy(forest),
+            "x": torch.from_numpy(np.ascontiguousarray(feats)).clone(),
+            "y_change": torch.from_numpy(np.ascontiguousarray(labels)).clone(),
+            "y_month": torch.from_numpy(np.ascontiguousarray(y_month)).clone(),
+            "weight": torch.from_numpy(np.ascontiguousarray(weight)).clone(),
+            "forest": torch.from_numpy(np.ascontiguousarray(forest)).clone(),
         }
+
+
+def _pad_to(arr: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
+    """Right/bottom-pad ``arr`` with zeros to ``target_shape``."""
+    if arr.shape == target_shape:
+        return arr
+    out = np.zeros(target_shape, dtype=arr.dtype)
+    sl = tuple(slice(0, min(a, t)) for a, t in zip(arr.shape, target_shape))
+    out[sl] = arr[sl]
+    return out
+
+
+def patch_collate(batch: list[dict]) -> dict:
+    """Stack patch dicts without PyTorch's shared-memory fastpath.
+
+    The default ``collate_tensor_fn`` allocates the output via
+    ``elem._typed_storage()._new_shared(...).resize_(...)``. On this
+    ROCm 2.5.1 build that path raises ``Trying to resize storage that is
+    not resizable`` for our tensors because the worker-side shared
+    storage is created in a state torch refuses to resize. ``torch.stack``
+    on freshly allocated, contiguous tensors avoids the resize call
+    entirely while still benefiting from pinned memory transfer.
+    """
+    keys = batch[0].keys()
+    return {k: torch.stack([b[k].contiguous() for b in batch], dim=0) for k in keys}
 
 
 def _oversample_positives(refs: list[PatchRef], factor: float) -> list[PatchRef]:

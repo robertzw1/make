@@ -7,21 +7,28 @@ PY    := .venv/bin/python
 # ----------------------------------------------------------------------------
 CONFIG       ?= configs/default.yaml
 SERVER_CFG   ?= configs/server.yaml
-CACHE        ?= /mnt/scratch/deforest/patches
-CHECKPOINTS  ?= /mnt/scratch/deforest/checkpoints
+CACHE        ?= $(CURDIR)/.cache/deforest/patches
+CHECKPOINTS  ?= $(CURDIR)/.cache/deforest/checkpoints
 SUBMISSION   ?= submissions/submission.geojson
 DEEP_CKPT    ?= $(CHECKPOINTS)/best.pt
 GBM_MODEL    ?= models/gbm.txt
-# ROCm wheel index for the MI300X droplet. Swap for the CUDA index on an NVIDIA box.
-TORCH_INDEX  ?= https://download.pytorch.org/whl/rocm6.2
-TORCH_PKGS   ?= torch==2.5.1 torchvision==0.20.1
+# Dataset root — symlinked to makeathon26/data/makeathon-challenge by default.
+DATA_ROOT    ?= data/makeathon-challenge
+MAKEATHON_DATA ?= ../makeathon26/data/makeathon-challenge
+# PyTorch wheel index. ROCm on MI300X droplets; CPU on default Linux hosts.
+TORCH_INDEX  ?= https://download.pytorch.org/whl/cpu
+TORCH_PKGS   ?= torch torchvision
 
-.PHONY: help install install-gpu mock baseline train-gbm submit evaluate \
-        preprocess train-deep submit-ensemble runtime test clean
+.PHONY: help install install-gpu install-torch link-data mock baseline train-gbm submit evaluate \
+        preprocess train-deep submit-ensemble runtime test clean all
 
 help:
-	@echo "Local / laptop targets:"
+	@echo "One-shot setup:"
+	@echo "  make setup         Create .venv, install deps, link the dataset"
+	@echo ""
+	@echo "Local / CPU targets:"
 	@echo "  install            Create .venv and install CPU requirements"
+	@echo "  link-data          Symlink data/makeathon-challenge -> MAKEATHON_DATA"
 	@echo "  mock               Generate a synthetic tile under data/makeathon-challenge/"
 	@echo "  baseline           Produce a submission with the zero-training consensus model"
 	@echo "  train-gbm          Train the LightGBM Tier-1 model"
@@ -29,20 +36,23 @@ help:
 	@echo "  evaluate           Local metrics against training labels"
 	@echo "  test               Run unit tests"
 	@echo ""
-	@echo "Server / MI300X targets (CONFIG=configs/server.yaml):"
-	@echo "  install-gpu        Install ROCm PyTorch + GPU extras on top of install"
+	@echo "Server / GPU targets (CONFIG=configs/server.yaml):"
+	@echo "  install-gpu        Install ROCm/CUDA PyTorch + GPU extras on top of install"
+	@echo "  install-torch      Install CPU-only PyTorch (optional; enables deep targets)"
 	@echo "  runtime            Print detected hardware + autoscaled defaults"
-	@echo "  preprocess         Pre-compute per-tile feature caches on /mnt/scratch"
+	@echo "  preprocess         Pre-compute per-tile feature caches"
 	@echo "  train-deep         Train the ChangeUNet deep model"
-	@echo "  submit-ensemble    Ensemble deep + GBM → final submission.geojson"
+	@echo "  submit-ensemble    Ensemble deep + GBM -> final submission.geojson"
 
 # ---------------------------------------------------------------------------
-# Environment
+# Setup
 # ---------------------------------------------------------------------------
+
+setup: install link-data
+	@echo "[setup] ready — try 'make baseline' or 'make test'"
 
 .venv:
-	python3 -m venv .venv
-	.venv/bin/pip install -U pip uv
+	./scripts/bootstrap_env.sh .venv
 
 install: .venv
 	.venv/bin/pip install -r requirements.txt
@@ -52,12 +62,32 @@ install-gpu: install
 	.venv/bin/pip install --index-url $(TORCH_INDEX) $(TORCH_PKGS)
 	.venv/bin/pip install -r requirements-gpu.txt
 
+# Installs the CPU-only PyTorch wheel so the `deep` targets become usable on
+# a laptop / CI host without a GPU. Safe to run on top of `install`.
+install-torch: install
+	.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+	.venv/bin/pip install -r requirements-gpu.txt
+
+# Symlink the challenge dataset from ../makeathon26/data/makeathon-challenge
+# into ./data/makeathon-challenge if it's not already present. This keeps
+# the configured `data.root` working in the Docker workspace layout.
+link-data:
+	@if [[ -e $(DATA_ROOT) && ! -L $(DATA_ROOT) ]]; then \
+	    echo "[link-data] $(DATA_ROOT) already exists (not a symlink) — leaving it alone"; \
+	elif [[ -d $(MAKEATHON_DATA) ]]; then \
+	    mkdir -p $$(dirname $(DATA_ROOT)); \
+	    ln -sfn $(abspath $(MAKEATHON_DATA)) $(DATA_ROOT); \
+	    echo "[link-data] $(DATA_ROOT) -> $$(readlink $(DATA_ROOT))"; \
+	else \
+	    echo "[link-data] $(MAKEATHON_DATA) not found — run 'make mock' to generate a synthetic tile"; \
+	fi
+
 # ---------------------------------------------------------------------------
-# Laptop pipeline (unchanged)
+# Laptop pipeline
 # ---------------------------------------------------------------------------
 
 mock: install
-	$(PY) scripts/generate_mock_data.py --out data/makeathon-challenge --tile MOCK_0_0
+	$(PY) scripts/generate_mock_data.py --out $(DATA_ROOT) --tile MOCK_0_0
 
 baseline: install
 	$(PY) scripts/build_submission.py --model baseline --config $(CONFIG) \
@@ -68,14 +98,14 @@ train-gbm: install
 
 submit: install
 	$(PY) scripts/build_submission.py --model gbm --config $(CONFIG) \
-	    --gbm-model $(GBM_MODEL) --out submissions/gbm.geojson
+	    --gbm-model $(GBM_MODEL) --out submissions/gbm.geojson --split test
 
 evaluate: install
 	$(PY) scripts/evaluate.py --config $(CONFIG) \
 	    --predictions submissions/baseline.geojson
 
 # ---------------------------------------------------------------------------
-# Server pipeline (MI300X)
+# Server pipeline (MI300X / GPU)
 # ---------------------------------------------------------------------------
 
 runtime: install
